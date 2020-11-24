@@ -8,7 +8,7 @@ import cats.effect.{Blocker, Concurrent, ContextShift, Sync, Timer}
 import cats.implicits._
 import com.github.mjakubowski84.parquet4s._
 import com.github.mjakubowski84.parquet4s.parquet.logger.Logger
-import fs2.{Pipe, Pull, Stream}
+import fs2.{INothing, Pipe, Pull, Pure, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.hadoop.{ParquetWriter => HadoopParquetWriter}
@@ -28,7 +28,8 @@ object rotatingWriter {
       maxDuration = DefaultMaxDuration,
       preWriteTransformation = t => Stream.emit(t),
       partitionBy = Seq.empty,
-      writeOptions = ParquetWriter.Options()
+      writeOptions = ParquetWriter.Options(),
+      postWriteHandler = None
     )
 
   }
@@ -78,6 +79,17 @@ object rotatingWriter {
      * @tparam X Schema type
      */
     def preWriteTransformation[X](transformation: T => Stream[F, X]): Builder[F, T, X]
+
+    /**
+     * Adds a handler after record writes, exposing some of the internal state of the flow.
+     * Intended for lower level monitoring and control.
+     *
+     * @param handler a function called after writing a record,
+     *                receiving a snapshot of the internal state of the flow as a parameter.
+     */
+    def withPostWriteHandler(handler: PostWriteState[F, T] => Unit): Builder[F, T, W]
+
+
     /**
      * Builds final writer pipe.
      */
@@ -94,7 +106,8 @@ object rotatingWriter {
                                               maxDuration: FiniteDuration,
                                               preWriteTransformation: T => Stream[F, W],
                                               partitionBy: Seq[String],
-                                              writeOptions: ParquetWriter.Options
+                                              writeOptions: ParquetWriter.Options,
+                                              postWriteHandler: Option[PostWriteState[F, T] => Unit]
                                             ) extends Builder[F, T, W] {
 
     override def maxCount(maxCount: Long): Builder[F, T, W] = copy(maxCount = maxCount)
@@ -107,7 +120,8 @@ object rotatingWriter {
                                                            timer : Timer[F],
                                                            concurrent: Concurrent[F],
                                                            contextShift: ContextShift[F]): Pipe[F, T, T] =
-      rotatingWriter.write[F, T, W](blocker, basePath, maxCount, maxDuration, partitionBy, preWriteTransformation, writeOptions)
+      rotatingWriter.write[F, T, W](blocker, basePath, maxCount, maxDuration, partitionBy, preWriteTransformation,
+                                    writeOptions, postWriteHandler)
 
     override def preWriteTransformation[X](transformation: T => Stream[F, X]): Builder[F, T, X] =
       BuilderImpl(
@@ -115,9 +129,17 @@ object rotatingWriter {
         maxDuration = maxDuration,
         preWriteTransformation = transformation,
         partitionBy = partitionBy,
-        writeOptions = writeOptions
+        writeOptions = writeOptions,
+        postWriteHandler = postWriteHandler
       )
+
+    override def withPostWriteHandler(handler: PostWriteState[F, T] => Unit): Builder[F, T, W] = copy(postWriteHandler = Some(handler))
   }
+
+  case class PostWriteState[F[_], W](count: Long,
+                                     lastProcessed: W,
+                                     partitions: F[Set[Path]],
+                                     flush: () => Unit)
 
   private sealed trait WriterEvent[T, W]
   private case class DataEvent[T, W](data: W) extends WriterEvent[T, W]
@@ -147,6 +169,7 @@ object rotatingWriter {
                                            options: ParquetWriter.Options,
                                            writersRef: Ref[F, Map[Path, RecordWriter[F]]],
                                            maxCount: Long,
+                                           postWriteHandler: Option[PostWriteState[F, T] => Unit],
                                            partitionBy: List[String],
                                            schema: MessageType,
                                            encode: W => F[RowParquetRecord],
@@ -220,11 +243,20 @@ object rotatingWriter {
         case Some((RotateEvent(), tail)) =>
           rotatePull("write timeout") >> writeAllPull(tail, count = 0)
         case Some((OutputEvent(out), tail)) =>
-          Pull.output1(out) >> writeAllPull(tail, count)
+          Pull.output1(out) >> postWrite(out, count, tail) >> writeAllPull(tail, count)
         case _ =>
           Pull.done
       }
     }
+
+    def postWrite(msg: T, count: Long, tail: Stream[F, WriterEvent[T, W]]): Pull[Pure, INothing, Option[Unit]] =
+      Pull.pure(
+        postWriteHandler.map(_.apply(PostWriteState(
+          count = count,
+          lastProcessed = msg,
+          partitions = writersRef.get.map(_.keySet),
+          flush = () => rotatePull("manually forced") >> writeAllPull(tail, count = 0)
+        ))))
 
     def writeAll(in: Stream[F, WriterEvent[T, W]]): Stream[F, T] =
       writeAllPull(in, count = 0).stream.onFinalize(dispose)
@@ -236,7 +268,8 @@ object rotatingWriter {
                                                                                                     maxDuration: FiniteDuration,
                                                                                                     partitionBy: Seq[String],
                                                                                                     prewriteTransformation: T => Stream[F, W],
-                                                                                                    options: ParquetWriter.Options
+                                                                                                    options: ParquetWriter.Options,
+                                                                                                    postWriteHandler: Option[PostWriteState[F, T] => Unit]
                                                                                                    )(implicit F: Concurrent[F]): Pipe[F, T, T] =
     in =>
       for {
@@ -252,6 +285,7 @@ object rotatingWriter {
             options = options,
             writersRef = Ref.unsafe(Map.empty),
             maxCount = maxCount,
+            postWriteHandler = postWriteHandler,
             partitionBy = partitionBy.toList,
             schema = schema,
             encode = encode,

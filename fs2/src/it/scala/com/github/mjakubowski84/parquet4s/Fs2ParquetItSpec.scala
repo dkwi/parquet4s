@@ -312,4 +312,65 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with Inspectors {
     testStream.compile.drain.as(succeed).unsafeToFuture()
   }
 
+  it should "monitor written rows and flush on signal" in {
+    case class User(name: String, id: Int, id_part: String)
+
+    val maxCount = 10
+    val usersToWrite = 33
+    val partitions = 2
+    val lastToFlushOnDemand = 2
+
+    def genUser(id: Int) = User(s"name_$id", id, (id % partitions).toString) // Two partitions : even and odd `id`
+
+    // Mimics a metrics library
+    var metrics = Vector.empty[Long]
+    def gauge(v: Long): Unit = metrics :+= v
+
+    val users = LazyList.range(start = 0, end = usersToWrite).map(i => genUser(i))
+
+    def write(blocker: Blocker, path: Path): Stream[IO, Vector[User]] =
+      Stream
+        .iterable(users)
+        .through(parquet.viaParquet[IO, User]
+          .options(writeOptions)
+          .maxCount(maxCount)
+          .partitionBy("id_part")
+          .withPostWriteHandler { state =>
+            gauge(state.count)                                               // use-case 1 : monitoring internal counter
+            if (state.lastProcessed.id > usersToWrite - lastToFlushOnDemand) // use-case 2 : on demand flush. e.g: the last two records must be in separate files
+              state.flush()
+          }
+          .write(blocker, path.toString)
+        )
+        .fold(Vector.empty[User])(_ :+ _)
+
+    val testStream =
+      for {
+        blocker <- Stream.resource(Blocker[IO])
+        path <- tempDirectoryStream[IO](blocker, tmpDir)
+        writtenData <- write(blocker, path)
+        readData <- read[User](blocker, path)
+        parquetFiles <- listParquetFiles(blocker, path)
+      } yield {
+        writtenData should have size users.size
+        writtenData should contain theSameElementsAs users
+
+        readData should have size users.size
+        readData should contain theSameElementsAs users
+
+        parquetFiles should have size (((usersToWrite / maxCount) * partitions) + 1 + lastToFlushOnDemand) // 9 == ( 33 / 10 ) * 2 + 1[remainder] + 2
+
+        metrics should be((0 until usersToWrite) map (i => (i % 10) + 1)) // Vector(1..10,1..10,1..10,1,2,3) - the counter is flushed 3 time and the last "batch" is just 1,2,3
+
+        val readDataPartitioned = parquetFiles flatMap (p => read[User](blocker, p).compile.toVector.unsafeRunSync())
+
+        val (remainder, full) = readDataPartitioned.partition(_.head.id >= usersToWrite - lastToFlushOnDemand)
+        every(full) should have size (maxCount / partitions)                              // == 5 records in completed files
+        remainder should have size (usersToWrite - (usersToWrite / maxCount) * maxCount)  // == 3 files are flushed prematurely
+        every(remainder) should have size 1
+      }
+
+    testStream.compile.drain.as(succeed).unsafeToFuture()
+
+  }
 }
