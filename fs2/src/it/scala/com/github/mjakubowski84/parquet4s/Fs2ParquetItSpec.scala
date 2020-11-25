@@ -69,248 +69,248 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with Inspectors {
     directoryStream[IO](blocker, path)
       .filter(_.toString.endsWith(".parquet"))
       .fold(Vector.empty[Path])(_ :+ _)
-  
-  it should "write and read single parquet file" in {
-    val outputFileName = "data.parquet"
-    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
-      Stream
-        .iterable(data)
-        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
 
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        readData <- write(blocker, path) ++ read[Data](blocker, path)
-      } yield readData should contain theSameElementsInOrderAs data
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "write and read single parquet file using projection" in {
-    val outputFileName = "data.parquet"
-    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
-      Stream
-        .iterable(data)
-        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
-
-    implicit val projectedSchema: MessageType = Types.buildMessage().addField(
-      Types.primitive(INT64, Repetition.REQUIRED).named("i")
-    ).named("projected-schema")
-
-    def readProjected[T: ParquetRecordDecoder: ParquetSchemaResolver](blocker: Blocker, path: Path): Stream[IO, Vector[T]] =
-      parquet.fromParquet[IO, T].projection.read(blocker, path.toString).fold(Vector.empty[T])(_ :+ _)
-
-    val expectedRecords = data.map(d => RowParquetRecord.empty.add("i", d.i, vcc))
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        readData <- write(blocker, path) ++ readProjected[RowParquetRecord](blocker, path)
-      } yield readData should contain theSameElementsInOrderAs expectedRecords
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "flush already processed data to file on failure" in {
-    val numberOfProcessedElementsBeforeFailure = 5
-    val outputFileName = "data.parquet"
-    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
-      Stream
-        .iterable(data)
-        .take(numberOfProcessedElementsBeforeFailure)
-        .append(Stream.raiseError[IO](new RuntimeException("test exception")))
-        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
-        .handleErrorWith(_ => Stream.empty)
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        readData <- write(blocker, path) ++ read[Data](blocker, path)
-      } yield readData should contain theSameElementsInOrderAs data.take(numberOfProcessedElementsBeforeFailure)
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "write files and rotate by max file size" in {
-    val maxCount = writeOptions.rowGroupSize
-    val expectedNumberOfFiles = RowGroupsPerFile
-
-    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
-      Stream
-        .iterable(data)
-        .through(parquet.viaParquet[IO, Data]
-          .maxCount(maxCount)
-          .options(writeOptions)
-          .write(blocker, path.toString)
-        )
-        .fold(Vector.empty[Data])(_ :+ _)
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        writtenData <- write(blocker, path)
-        readData <- read[Data](blocker, path)
-        parquetFiles <- listParquetFiles(blocker, path)
-      } yield {
-        writtenData should contain theSameElementsAs data
-        readData should contain theSameElementsAs data
-        parquetFiles should have size expectedNumberOfFiles
-      }
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "write files and rotate by max write duration" in {
-    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
-      Stream
-        .iterable(data)
-        .through(parquet.viaParquet[IO, Data]
-          .maxDuration(25.millis)
-          .maxCount(count)
-          .options(writeOptions)
-          .write(blocker, path.toString)
-        )
-        .fold(Vector.empty[Data])(_ :+ _)
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        writtenData <- write(blocker, path)
-        readData <- read[Data](blocker, path)
-        parquetFiles <- listParquetFiles(blocker, path)
-      } yield {
-        writtenData should contain theSameElementsAs data
-        readData should contain theSameElementsAs data
-        parquetFiles.size should be > 1
-      }
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "write and read partitioned files" in {
-    def write(blocker: Blocker, path: Path): Stream[IO, Vector[DataPartitioned]] =
-      Stream
-        .iterable(dataPartitioned)
-        .through(parquet.viaParquet[IO, DataPartitioned]
-          .maxCount(count)
-          .partitionBy("a", "b")
-          .options(writeOptions)
-          .write(blocker, path.toString)
-        )
-        .fold(Vector.empty[DataPartitioned])(_ :+ _)
-
-    def listParquetFiles(blocker: Blocker, path: Path): Stream[IO, Vector[Path]] =
-      walk[IO](blocker, path)
-        .filter(_.toString.endsWith(".parquet"))
-        .fold(Vector.empty[Path])(_ :+ _)
-
-    def partitionValue(path: Path): (String, String) = {
-      val split = path.getFileName.toString.split("=")
-      (split(0), split(1))
-    }
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        writtenData <- write(blocker, path)
-        parquetFiles <- listParquetFiles(blocker, path)
-        readData <- read[DataPartitioned](blocker, path)
-      } yield {
-        writtenData should contain theSameElementsAs dataPartitioned
-        parquetFiles.size should be > 1
-        val partitions = parquetFiles.map { path =>
-          (partitionValue(path.getParent.getParent), partitionValue(path.getParent))
-        }
-        forEvery(partitions) { case (("a", aVal), ("b", bVal)) =>
-          dictA should contain(aVal)
-          dictB should contain(bVal)
-        }
-        readData should contain theSameElementsAs dataPartitioned
-      }
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "transform data before writing" in {
-    val partitions = Set("x", "y", "z")
-    val partitionSize = count / partitions.size
-    val partitionData = data.take(partitionSize)
-
-    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
-      Stream
-        .iterable(partitionData)
-        .through(parquet.viaParquet[IO, Data]
-          .maxCount(partitionSize)
-          .preWriteTransformation[DataTransformed] { data =>
-            Stream.iterable(partitions).map(partition => DataTransformed(data, partition))
-          }
-          .partitionBy("partition")
-          .options(writeOptions)
-          .write(blocker, path.toString)
-        )
-        .fold(Vector.empty[Data])(_ :+ _)
-
-    def read(blocker: Blocker, path: Path): Stream[IO, Map[String, Vector[Data]]] =
-      parquet
-        .fromParquet[IO, DataTransformed].read(blocker, path.toString)
-        .map { case DataTransformed(i, s, partition) => Map(partition -> Vector(Data(i, s))) }
-        .reduceSemigroup
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        writtenData <- write(blocker, path)
-        partitionPaths <- directoryStream[IO](blocker, path).fold(Vector.empty[Path])(_ :+ _)
-        partitionedData <- read(blocker, path)
-      } yield {
-        writtenData should contain theSameElementsAs partitionData
-        partitionPaths should have size partitions.size
-        forEvery(partitionPaths)(_.getFileName.toString should fullyMatch regex "partition=[xyz]")
-        partitionedData.keys should be(partitions)
-        forEvery(partitionedData.keys) { partition =>
-          partitionedData(partition) should contain theSameElementsAs partitionData
-        }
-      }
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
-
-  it should "flush already processed files on failure when using rotating writer" in {
-    val numberOfProcessedElementsBeforeFailure = 5
-
-    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
-      Stream
-        .iterable(data)
-        .take(numberOfProcessedElementsBeforeFailure)
-        .append(Stream.raiseError[IO](new RuntimeException("test exception")))
-        .through(parquet.viaParquet[IO, Data]
-          .options(writeOptions)
-          .partitionBy("s")
-          .write(blocker, path.toString)
-        )
-        .handleErrorWith(_ => Stream.empty)
-        .fold(Vector.empty[Data])(_ :+ _)
-
-    val testStream =
-      for {
-        blocker <- Stream.resource(Blocker[IO])
-        path <- tempDirectoryStream[IO](blocker, tmpDir)
-        writtenData <- write(blocker, path)
-        readData <- read[Data](blocker, path)
-      } yield {
-        writtenData should contain theSameElementsAs data.take(numberOfProcessedElementsBeforeFailure)
-        readData should contain theSameElementsAs data.take(numberOfProcessedElementsBeforeFailure)
-      }
-
-    testStream.compile.drain.as(succeed).unsafeToFuture()
-  }
+//  it should "write and read single parquet file" in {
+//    val outputFileName = "data.parquet"
+//    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
+//      Stream
+//        .iterable(data)
+//        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        readData <- write(blocker, path) ++ read[Data](blocker, path)
+//      } yield readData should contain theSameElementsInOrderAs data
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "write and read single parquet file using projection" in {
+//    val outputFileName = "data.parquet"
+//    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
+//      Stream
+//        .iterable(data)
+//        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
+//
+//    implicit val projectedSchema: MessageType = Types.buildMessage().addField(
+//      Types.primitive(INT64, Repetition.REQUIRED).named("i")
+//    ).named("projected-schema")
+//
+//    def readProjected[T: ParquetRecordDecoder: ParquetSchemaResolver](blocker: Blocker, path: Path): Stream[IO, Vector[T]] =
+//      parquet.fromParquet[IO, T].projection.read(blocker, path.toString).fold(Vector.empty[T])(_ :+ _)
+//
+//    val expectedRecords = data.map(d => RowParquetRecord.empty.add("i", d.i, vcc))
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        readData <- write(blocker, path) ++ readProjected[RowParquetRecord](blocker, path)
+//      } yield readData should contain theSameElementsInOrderAs expectedRecords
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "flush already processed data to file on failure" in {
+//    val numberOfProcessedElementsBeforeFailure = 5
+//    val outputFileName = "data.parquet"
+//    def write(blocker: Blocker, path: Path): Stream[IO, fs2.INothing] =
+//      Stream
+//        .iterable(data)
+//        .take(numberOfProcessedElementsBeforeFailure)
+//        .append(Stream.raiseError[IO](new RuntimeException("test exception")))
+//        .through(parquet.writeSingleFile[IO, Data](blocker, path.resolve(outputFileName).toString, writeOptions))
+//        .handleErrorWith(_ => Stream.empty)
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        readData <- write(blocker, path) ++ read[Data](blocker, path)
+//      } yield readData should contain theSameElementsInOrderAs data.take(numberOfProcessedElementsBeforeFailure)
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "write files and rotate by max file size" in {
+//    val maxCount = writeOptions.rowGroupSize
+//    val expectedNumberOfFiles = RowGroupsPerFile
+//
+//    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
+//      Stream
+//        .iterable(data)
+//        .through(parquet.viaParquet[IO, Data]
+//          .maxCount(maxCount)
+//          .options(writeOptions)
+//          .write(blocker, path.toString)
+//        )
+//        .fold(Vector.empty[Data])(_ :+ _)
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        writtenData <- write(blocker, path)
+//        readData <- read[Data](blocker, path)
+//        parquetFiles <- listParquetFiles(blocker, path)
+//      } yield {
+//        writtenData should contain theSameElementsAs data
+//        readData should contain theSameElementsAs data
+//        parquetFiles should have size expectedNumberOfFiles
+//      }
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "write files and rotate by max write duration" in {
+//    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
+//      Stream
+//        .iterable(data)
+//        .through(parquet.viaParquet[IO, Data]
+//          .maxDuration(25.millis)
+//          .maxCount(count)
+//          .options(writeOptions)
+//          .write(blocker, path.toString)
+//        )
+//        .fold(Vector.empty[Data])(_ :+ _)
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        writtenData <- write(blocker, path)
+//        readData <- read[Data](blocker, path)
+//        parquetFiles <- listParquetFiles(blocker, path)
+//      } yield {
+//        writtenData should contain theSameElementsAs data
+//        readData should contain theSameElementsAs data
+//        parquetFiles.size should be > 1
+//      }
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "write and read partitioned files" in {
+//    def write(blocker: Blocker, path: Path): Stream[IO, Vector[DataPartitioned]] =
+//      Stream
+//        .iterable(dataPartitioned)
+//        .through(parquet.viaParquet[IO, DataPartitioned]
+//          .maxCount(count)
+//          .partitionBy("a", "b")
+//          .options(writeOptions)
+//          .write(blocker, path.toString)
+//        )
+//        .fold(Vector.empty[DataPartitioned])(_ :+ _)
+//
+//    def listParquetFiles(blocker: Blocker, path: Path): Stream[IO, Vector[Path]] =
+//      walk[IO](blocker, path)
+//        .filter(_.toString.endsWith(".parquet"))
+//        .fold(Vector.empty[Path])(_ :+ _)
+//
+//    def partitionValue(path: Path): (String, String) = {
+//      val split = path.getFileName.toString.split("=")
+//      (split(0), split(1))
+//    }
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        writtenData <- write(blocker, path)
+//        parquetFiles <- listParquetFiles(blocker, path)
+//        readData <- read[DataPartitioned](blocker, path)
+//      } yield {
+//        writtenData should contain theSameElementsAs dataPartitioned
+//        parquetFiles.size should be > 1
+//        val partitions = parquetFiles.map { path =>
+//          (partitionValue(path.getParent.getParent), partitionValue(path.getParent))
+//        }
+//        forEvery(partitions) { case (("a", aVal), ("b", bVal)) =>
+//          dictA should contain(aVal)
+//          dictB should contain(bVal)
+//        }
+//        readData should contain theSameElementsAs dataPartitioned
+//      }
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "transform data before writing" in {
+//    val partitions = Set("x", "y", "z")
+//    val partitionSize = count / partitions.size
+//    val partitionData = data.take(partitionSize)
+//
+//    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
+//      Stream
+//        .iterable(partitionData)
+//        .through(parquet.viaParquet[IO, Data]
+//          .maxCount(partitionSize)
+//          .preWriteTransformation[DataTransformed] { data =>
+//            Stream.iterable(partitions).map(partition => DataTransformed(data, partition))
+//          }
+//          .partitionBy("partition")
+//          .options(writeOptions)
+//          .write(blocker, path.toString)
+//        )
+//        .fold(Vector.empty[Data])(_ :+ _)
+//
+//    def read(blocker: Blocker, path: Path): Stream[IO, Map[String, Vector[Data]]] =
+//      parquet
+//        .fromParquet[IO, DataTransformed].read(blocker, path.toString)
+//        .map { case DataTransformed(i, s, partition) => Map(partition -> Vector(Data(i, s))) }
+//        .reduceSemigroup
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        writtenData <- write(blocker, path)
+//        partitionPaths <- directoryStream[IO](blocker, path).fold(Vector.empty[Path])(_ :+ _)
+//        partitionedData <- read(blocker, path)
+//      } yield {
+//        writtenData should contain theSameElementsAs partitionData
+//        partitionPaths should have size partitions.size
+//        forEvery(partitionPaths)(_.getFileName.toString should fullyMatch regex "partition=[xyz]")
+//        partitionedData.keys should be(partitions)
+//        forEvery(partitionedData.keys) { partition =>
+//          partitionedData(partition) should contain theSameElementsAs partitionData
+//        }
+//      }
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
+//
+//  it should "flush already processed files on failure when using rotating writer" in {
+//    val numberOfProcessedElementsBeforeFailure = 5
+//
+//    def write(blocker: Blocker, path: Path): Stream[IO, Vector[Data]] =
+//      Stream
+//        .iterable(data)
+//        .take(numberOfProcessedElementsBeforeFailure)
+//        .append(Stream.raiseError[IO](new RuntimeException("test exception")))
+//        .through(parquet.viaParquet[IO, Data]
+//          .options(writeOptions)
+//          .partitionBy("s")
+//          .write(blocker, path.toString)
+//        )
+//        .handleErrorWith(_ => Stream.empty)
+//        .fold(Vector.empty[Data])(_ :+ _)
+//
+//    val testStream =
+//      for {
+//        blocker <- Stream.resource(Blocker[IO])
+//        path <- tempDirectoryStream[IO](blocker, tmpDir)
+//        writtenData <- write(blocker, path)
+//        readData <- read[Data](blocker, path)
+//      } yield {
+//        writtenData should contain theSameElementsAs data.take(numberOfProcessedElementsBeforeFailure)
+//        readData should contain theSameElementsAs data.take(numberOfProcessedElementsBeforeFailure)
+//      }
+//
+//    testStream.compile.drain.as(succeed).unsafeToFuture()
+//  }
 
   it should "monitor written rows and flush on signal" in {
     case class User(name: String, id: Int, id_part: String)
@@ -337,8 +337,10 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with Inspectors {
           .partitionBy("id_part")
           .withPostWriteHandler { state =>
             gauge(state.count)                                               // use-case 1 : monitoring internal counter
-            if (state.lastProcessed.id > usersToWrite - lastToFlushOnDemand) // use-case 2 : on demand flush. e.g: the last two records must be in separate files
+            if (state.lastProcessed.id > usersToWrite - lastToFlushOnDemand) { // use-case 2 : on demand flush. e.g: the last two records must be in separate files
+              println(s"[${Thread.currentThread().getName}] flushing! = ${state.lastProcessed.id}")
               state.flush()
+            }
           }
           .write(blocker, path.toString)
         )
@@ -350,7 +352,8 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with Inspectors {
         path <- tempDirectoryStream[IO](blocker, tmpDir)
         writtenData <- write(blocker, path)
         readData <- read[User](blocker, path)
-        parquetFiles <- listParquetFiles(blocker, path)
+        parquetFiles0 <- listParquetFiles(blocker, Paths.get(path.toString,"id_part=0"))
+        parquetFiles1 <- listParquetFiles(blocker, Paths.get(path.toString,"id_part=1"))
       } yield {
         writtenData should have size users.size
         writtenData should contain theSameElementsAs users
@@ -358,6 +361,14 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with Inspectors {
         readData should have size users.size
         readData should contain theSameElementsAs users
 
+        println(s"[${Thread.currentThread().getName}] users = ${users.size}")
+        println(s"[${Thread.currentThread().getName}] read = ${readData.size}")
+        println(s"[${Thread.currentThread().getName}] written = ${writtenData.size}")
+        println(s"[${Thread.currentThread().getName}] metrics =  $metrics")
+        println(s"[${Thread.currentThread().getName}] parquetFile0 = $parquetFiles0")
+        println(s"[${Thread.currentThread().getName}] parquetFile1 = $parquetFiles1")
+
+        val parquetFiles = parquetFiles0 ++ parquetFiles1
         parquetFiles should have size (((usersToWrite / maxCount) * partitions) + 1 + lastToFlushOnDemand) // 9 == ( 33 / 10 ) * 2 + 1[remainder] + 2
 
         metrics should be((0 until usersToWrite) map (i => (i % 10) + 1)) // Vector(1..10,1..10,1..10,1,2,3) - the counter is flushed 3 time and the last "batch" is just 1,2,3

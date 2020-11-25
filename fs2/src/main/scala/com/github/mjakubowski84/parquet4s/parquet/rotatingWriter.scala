@@ -237,13 +237,13 @@ object rotatingWriter {
     private def writeAllPull(in: Stream[F, WriterEvent[T, W]], count: Long): Pull[F, T, Unit] = {
       in.pull.uncons1.flatMap {
         case Some((DataEvent(data), tail)) if count < maxCount =>
-          writePull(data) >> writeAllPull(tail, count + 1)
+          writePull(data) >> postWrite(data.asInstanceOf[T], count, tail) >> writeAllPull(tail, count + 1)
         case Some((DataEvent(data), tail)) =>
           writePull(data) >> rotatePull("max count reached") >> writeAllPull(tail, count = 0)
         case Some((RotateEvent(), tail)) =>
           rotatePull("write timeout") >> writeAllPull(tail, count = 0)
         case Some((OutputEvent(out), tail)) =>
-          Pull.output1(out) >> postWrite(out, count, tail) >> writeAllPull(tail, count)
+          Pull.output1(out) >> writeAllPull(tail, count)
         case _ =>
           Pull.done
       }
